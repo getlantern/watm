@@ -79,7 +79,11 @@ func (c *TCPConn) Write(b []byte) (n int, err error) {
 		return 0, syscall.EBADF
 	}
 	for {
-		n, err = writeFD(uintptr(c.rawConn.fd), b)
+		// writeFD reports bytes sent before an EAGAIN, so resume after them;
+		// retrying from the start would send them twice.
+		var nn int
+		nn, err = writeFD(uintptr(c.rawConn.fd), b[n:])
+		n += nn
 		if !errors.Is(err, syscall.EAGAIN) {
 			return n, err
 		}
