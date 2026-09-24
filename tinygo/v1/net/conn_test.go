@@ -63,6 +63,13 @@ func TestTCPConn_Read(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+	// The Go runtime leaves conn2's fd non-blocking, so a bare Read can run
+	// before the write lands and get EAGAIN. A deadline makes Read retry
+	// EAGAIN until the data (and later the EOF) arrives, without letting a
+	// regression hang the test.
+	if err := tcpConn2.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
 
 	n, err := tcpConn2.Read(bufRd)
 	if err != nil {
@@ -75,8 +82,8 @@ func TestTCPConn_Read(t *testing.T) {
 
 	// close the peer connection and read again
 	conn1.Close()
-	if _, err := tcpConn2.Read(bufRd); err == nil {
-		t.Fatal("read after peer-close: expected error, got nil")
+	if _, err := tcpConn2.Read(bufRd); !errors.Is(err, io.EOF) && !errors.Is(err, syscall.ECONNRESET) {
+		t.Fatalf("read after peer-close: expected io.EOF or syscall.ECONNRESET, got %v", err)
 	}
 
 	runtime.KeepAlive(conn1)
@@ -204,11 +211,18 @@ func TestTCPConn_SetNonBlock(t *testing.T) {
 	if _, err := conn2.Write([]byte("hello")); err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(10 * time.Microsecond) // wait for the packet to get through
 
-	// now tcpConn1 should be readable
-	if _, err := tcpConn1.Read(make([]byte, 16)); err != nil {
-		t.Fatal(err)
+	// now tcpConn1 should become readable. Retry EAGAIN while the write crosses
+	// loopback: a fixed short sleep here made the test flaky under load.
+	for deadline := time.Now().Add(5 * time.Second); ; {
+		_, err := tcpConn1.Read(make([]byte, 16))
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, syscall.EAGAIN) || time.Now().After(deadline) {
+			t.Fatal(err)
+		}
+		time.Sleep(time.Millisecond)
 	}
 
 	runtime.KeepAlive(conn1)
