@@ -332,7 +332,12 @@ func TestTCPConn_WritePartialProgress(t *testing.T) {
 	case <-time.After(30 * time.Second):
 		t.Fatal("timed out waiting for the peer to receive the message")
 	}
-	if err := <-written; err != nil {
-		t.Fatal(err)
+	select {
+	case err := <-written:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("Write did not return after the peer received the message")
 	}
 }
