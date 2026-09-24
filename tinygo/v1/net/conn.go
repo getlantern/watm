@@ -42,57 +42,55 @@ func RebuildTCPConn(fd int32) *TCPConn {
 
 // Read implements [net.Conn.Read].
 func (c *TCPConn) Read(b []byte) (n int, err error) {
-	if rdl := c.readDeadline; rdl.IsZero() {
-		// if no deadline set, behavior depends on blocking mode of the
-		// underlying file descriptor.
-		return syscallFnFd(c.rawConn, func(fd uintptr) (int, error) {
-			n, err := syscall.Read(syscallFd(fd), b)
-			if n == 0 && err == nil {
-				err = io.EOF
-			}
-			if n < 0 && err != nil {
-				n = 0
-			}
-			return n, err
-		})
-	} else {
-		// readDeadline is set, if EAGAIN/EWOULDBLOCK is returned,
-		// we retry until the deadline is reached.
-		for {
-			if n, err = syscallFnFd(c.rawConn, func(fd uintptr) (int, error) {
-				n, err := syscall.Read(syscallFd(fd), b)
-				if n == 0 && err == nil {
-					err = io.EOF
-				}
-				if n < 0 && err != nil {
-					n = 0
-				}
-				return n, err
-			}); errors.Is(err, syscall.EAGAIN) {
-				if time.Now().Before(rdl) {
-					continue
-				}
-			}
+	for {
+		n, err = c.read(b)
+		// Without a deadline, behavior depends on the blocking mode of the
+		// file descriptor. With one, EAGAIN/EWOULDBLOCK is retried until it
+		// passes.
+		if rdl := c.readDeadline; rdl.IsZero() || !errors.Is(err, syscall.EAGAIN) || !time.Now().Before(rdl) {
 			return n, err
 		}
 	}
 }
 
-// Write implements [net.Conn.Write].
-func (c *TCPConn) Write(b []byte) (n int, writeErr error) {
-	if err := c.rawConn.Write(func(fd uintptr) (done bool) {
-		n, writeErr = writeFD(fd, b)
-		if errors.Is(writeErr, syscall.EAGAIN) {
-			if wdl := c.writeDeadline; wdl.IsZero() || time.Now().Before(wdl) {
-				return false
-			}
-			writeErr = os.ErrDeadlineExceeded
-		}
-		return true
-	}); err != nil {
-		return n, err
+// read calls the syscall on the fd directly rather than through
+// RawConn.Control: the closure Control takes escapes through the interface, so
+// it costs a heap allocation on every call, and on the I/O path that makes
+// TinyGo's GC the dominant cost of moving a message.
+func (c *TCPConn) read(b []byte) (int, error) {
+	if c.rawConn.fd == 0 {
+		return 0, syscall.EBADF
 	}
-	return
+	n, err := syscall.Read(syscallFd(c.rawConn.fd), b)
+	if n == 0 && err == nil {
+		err = io.EOF
+	}
+	if n < 0 && err != nil {
+		n = 0
+	}
+	return n, err
+}
+
+// Write implements [net.Conn.Write].
+//
+// Like Read, it writes to the fd directly to keep the I/O path allocation-free.
+func (c *TCPConn) Write(b []byte) (n int, err error) {
+	if c.rawConn.fd == 0 {
+		return 0, syscall.EBADF
+	}
+	for {
+		// writeFD reports bytes sent before an EAGAIN, so resume after them;
+		// retrying from the start would send them twice.
+		var nn int
+		nn, err = writeFD(uintptr(c.rawConn.fd), b[n:])
+		n += nn
+		if !errors.Is(err, syscall.EAGAIN) {
+			return n, err
+		}
+		if wdl := c.writeDeadline; !wdl.IsZero() && !time.Now().Before(wdl) {
+			return n, os.ErrDeadlineExceeded
+		}
+	}
 }
 
 // Close implements [net.Conn.Close].

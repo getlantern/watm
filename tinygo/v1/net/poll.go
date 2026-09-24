@@ -45,6 +45,10 @@ const (
 var (
 	evts []event
 	subs []subscription
+
+	// Reused by Poll across calls; see Poll.
+	pollFds     []pollFd
+	pollRevents []uint16
 )
 
 type pollFd struct {
@@ -59,8 +63,16 @@ func _poll(fds []pollFd, maxTimeout int64) (nevents int32, err error) {
 	// timeout field needs to be submitted. Reserve a slot here for the clock
 	// subscription, and set fields that won't change between poll_oneoff calls.
 
-	subs = make([]subscription, 1, 128)
-	evts = make([]event, 0, 128)
+	// Reuse the subscription and event buffers across calls: the worker polls
+	// several times per message, and fresh 128-entry buffers each time kept
+	// TinyGo's GC running constantly.
+	if cap(subs) == 0 {
+		subs = make([]subscription, 1, 128)
+		evts = make([]event, 0, 128)
+	} else {
+		subs = subs[:1]
+		subs[0] = subscription{}
+	}
 
 	timeout := &subs[0]
 	eventtype := timeout.u.eventtype()
@@ -138,28 +150,39 @@ retry:
 	return int32(nevents), nil
 }
 
+// Poll waits for any of conns to become ready for its entry in events.
+//
+// The returned revents slice is reused by the next call to Poll, so copy it
+// if it must outlive that call.
+//
+// Poll is not safe for concurrent use: it shares package-level buffers, as
+// the underlying poll_oneoff subscription and event buffers always have.
+// Under TinyGo's cooperative scheduler that cannot interleave, since Poll
+// never yields between filling the buffers and returning.
 func Poll(conns []Conn, events []uint16) (nevents int32, revents []uint16, err error) {
 	if len(conns) != len(events) {
 		return 0, nil, syscall.EINVAL
 	}
 
-	fds := make([]pollFd, len(conns))
+	fds := pollFds[:0]
 	for i, conn := range conns {
-		fds[i] = pollFd{
+		fds = append(fds, pollFd{
 			fd:     uintptr(conn.Fd()),
 			events: events[i],
-		}
+		})
 	}
+	pollFds = fds
 
 	nevents, err = _poll(fds, -1)
 	if err != nil {
 		return nevents, nil, err
 	}
 
-	revents = make([]uint16, len(conns))
-	for i, fd := range fds {
-		revents[i] = fd.revents
+	revents = pollRevents[:0]
+	for _, fd := range fds {
+		revents = append(revents, fd.revents)
 	}
+	pollRevents = revents
 
 	return nevents, revents, nil
 }

@@ -5,7 +5,9 @@ package net_test
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"io"
+	"math/rand"
 	"net"
 	"runtime"
 	"syscall"
@@ -264,4 +266,83 @@ func TestTCPConn_SetReadDeadline(t *testing.T) {
 
 	runtime.KeepAlive(conn1)
 	runtime.KeepAlive(conn2)
+}
+
+// A write larger than the socket send buffer makes partial progress and then
+// hits EAGAIN on the non-blocking fd. Write must resume after the bytes already
+// sent, not resend the buffer from the start.
+func TestTCPConn_WritePartialProgress(t *testing.T) {
+	conn1, conn2, err := tcpConnPair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn1.Close()
+	defer conn2.Close()
+	if err := conn2.SetWriteBuffer(4096); err != nil {
+		t.Fatal(err)
+	}
+
+	var tcpConn2 *v1net.TCPConn
+	rawConn2, err := conn2.SyscallConn()
+	if err != nil {
+		t.Fatal(err)
+	} else if err := rawConn2.Control(func(fd uintptr) {
+		tcpConn2 = v1net.RebuildTCPConn(int32(fd))
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// The partial-write path only exists on a non-blocking fd; set it rather than
+	// rely on the Go runtime having done so.
+	if err := tcpConn2.SetNonBlock(true); err != nil {
+		t.Fatal(err)
+	}
+
+	// Non-repeating data: a periodic pattern would hide resent bytes whenever a
+	// partial write lands on a multiple of the period.
+	msg := make([]byte, 4<<20)
+	rand.New(rand.NewSource(1)).Read(msg)
+
+	got := make(chan []byte, 1)
+	go func() {
+		var buf bytes.Buffer
+		chunk := make([]byte, 1024)
+		for buf.Len() < len(msg) {
+			time.Sleep(50 * time.Microsecond) // drain slowly so the sender hits EAGAIN
+			n, err := conn1.Read(chunk)
+			buf.Write(chunk[:n])
+			if err != nil {
+				break
+			}
+		}
+		got <- buf.Bytes()
+	}()
+
+	// Write runs on its own goroutine so a regression fails the test rather than
+	// hanging it: resent bytes let the reader stop early, leaving Write retrying
+	// EAGAIN with nothing draining the socket.
+	written := make(chan error, 1)
+	go func() {
+		n, err := tcpConn2.Write(msg)
+		if err == nil && n != len(msg) {
+			err = fmt.Errorf("Write returned %d, want %d", n, len(msg))
+		}
+		written <- err
+	}()
+
+	select {
+	case b := <-got:
+		if !bytes.Equal(b, msg) {
+			t.Fatalf("peer received %d bytes that differ from the %d sent", len(b), len(msg))
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("timed out waiting for the peer to receive the message")
+	}
+	select {
+	case err := <-written:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("Write did not return after the peer received the message")
+	}
 }
