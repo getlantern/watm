@@ -291,6 +291,11 @@ func TestTCPConn_WritePartialProgress(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+	// The partial-write path only exists on a non-blocking fd; set it rather than
+	// rely on the Go runtime having done so.
+	if err := tcpConn2.SetNonBlock(true); err != nil {
+		t.Fatal(err)
+	}
 
 	// Non-repeating data: a periodic pattern would hide resent bytes whenever a
 	// partial write lands on a multiple of the period.
