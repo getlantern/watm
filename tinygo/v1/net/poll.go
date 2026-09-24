@@ -154,6 +154,11 @@ retry:
 //
 // The returned revents slice is reused by the next call to Poll, so copy it
 // if it must outlive that call.
+//
+// Poll is not safe for concurrent use: it shares package-level buffers, as
+// the underlying poll_oneoff subscription and event buffers always have.
+// Under TinyGo's cooperative scheduler that cannot interleave, since Poll
+// never yields between filling the buffers and returning.
 func Poll(conns []Conn, events []uint16) (nevents int32, revents []uint16, err error) {
 	if len(conns) != len(events) {
 		return 0, nil, syscall.EINVAL
